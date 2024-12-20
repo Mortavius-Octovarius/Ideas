@@ -1,0 +1,9 @@
+def attention(neuron1, neuron2):
+    """Calculates attention between two neurons, incorporating directional influence."""
+    direction1 = neuron1._calculate_spherical_harmonics()
+    direction2 = neuron2._calculate_spherical_harmonics()
+    #Calculate similarity based on directions
+    directional_similarity = np.dot(direction1, direction2)
+    #Other attention calculations...
+    attention_weight = directional_similarity #Example, can be combined with other attention factors
+    return attention_weight
