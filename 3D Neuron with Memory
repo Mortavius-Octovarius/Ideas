@@ -1,64 +1,119 @@
 import numpy as np
-from scipy.special import sph_harm
 
 class Neuron:
-    def __init__(self, position):
+    def __init__(self, position, learning_rate=0.01):
+        """Initializes a Neuron object."""
+        self.position = np.array(position)
         self.weights = {
-            'x_input': None,
-            'y_input': None,
-            'z_input': None,
-            'lifelong_learning': None,
-            'meta_awareness': None
+            'pre_training': np.random.rand(3),
+            'input': np.random.rand(3),
+            'long_term': np.zeros(3),
+            'q_learning': np.random.rand(3)
         }
-        self.bias = 0
+        self.bias = np.random.rand()  # Initialize bias randomly
         self.type = None
-        self.position = position
+        self.activation = self.sigmoid
+        self.learning_rate = learning_rate
+        self.last_input = None  # Store the last input for backpropagation
 
-    def set_type(self, direction):
-        if direction == 'X':
-            self.type = 'input'
-        elif direction == 'Y':
-            self.type = 'hidden'
-        elif direction == 'Z':
-            self.type = 'output'
-        else:
-            raise ValueError("Invalid direction")
-
-    def init_weights(self, l2_norm=1.0):
-        # Initialize weights using spherical harmonics to account for 3D position
-        l, m = divmod(self.position[0], 2)
-        if m > 0:
-            l += 1
-
-        self.weights['x_input'] = sph_harm(m, l, np.pi * self.position[1] / (2 ** self.position[0]), 2 * np.pi * self.position[2]).real
-        self.weights['y_input'] = sph_harm(-m, l, 2 * np.pi * self.position[1], np.pi * self.position[0] / (2 ** self.position[2])).real
-        self.weights['z_input'] = sph_harm(m, l - abs(m), 2 * np.pi * self.position[1], np.pi * self.position[2]).real
-
-        # Normalize weights to have unit L2 norm
-        for w in self.weights.values():
-            if w is not None:
-                w /= np.linalg.norm(w)
-
-    def set_weights(self, lifelong_learning, meta_awareness):
-        self.weights['lifelong_learning'] = lifelong_learning
-        self.weights['meta_awareness'] = meta_awareness
+    def set_type(self, type_name):
+        """Sets the type of the neuron."""
+        self.type = type_name
 
     def process_input(self, input_value):
-        if self.type == 'input':
-            weighted_sum = np.dot(input_value, [self.weights['x_input'], self.weights['y_input'], self.weights['z_input']])
-        elif self.type in ['hidden', 'output']:
-            weighted_sum = 0
-            for i, weight in enumerate(self.weights.values()):
-                if weight is not None:
-                    weighted_sum += np.dot(input_value[i], weight)
-        else:
-            raise ValueError("Invalid neuron type")
+        """Processes the input and stores the input for backpropagation."""
+        if self.type is None:
+            raise ValueError("Neuron type must be set.")
 
-        # Adding bias and applying activation function (e.g., sigmoid)
-        output = self.sigmoid(weighted_sum + self.bias)
-
+        used_weights = self.weights.get(self.type, self.weights['input'])
+        self.last_input = input_value # Store the input for backpropagation
+        weighted_sum = np.dot(input_value, used_weights) + self.bias
+        output = self.activation(weighted_sum)
         return output
+
+    def update_long_term_weights(self, input_value, learning_signal):
+        """Updates long-term weights."""
+        alpha = 0.1
+        self.weights['long_term'] = (1 - alpha) * self.weights['long_term'] + alpha * input_value * learning_signal
+
+    def update_q_learning_weights(self, state, action, reward, next_state, next_max_q, discount_factor=0.9):
+        """Updates Q-learning weights."""
+        current_q = np.dot(state, self.weights['q_learning'])
+        target_q = reward + discount_factor * next_max_q
+        delta = target_q - current_q
+        self.weights['q_learning'] += self.learning_rate * delta * state
+
+    def set_activation_function(self, activation_function):
+        """Sets the activation function."""
+        self.activation = activation_function
+
+    def backward(self, error):
+        """Performs backpropagation for the input weights."""
+        if self.last_input is None:
+            raise ValueError("No input processed yet. Call process_input first.")
+
+        if self.activation == self.sigmoid:
+            derivative = self.sigmoid_derivative(self.process_input(self.last_input))
+        elif self.activation == self.relu:
+            derivative = self.relu_derivative(self.process_input(self.last_input))
+        else:
+            raise ValueError("Derivative for given activation not defined.")
+
+        weight_gradients = error * derivative * self.last_input
+        bias_gradient = error * derivative
+        self.weights['input'] += self.learning_rate * weight_gradients
+        self.bias += self.learning_rate * bias_gradient
+        return weight_gradients # Return the gradients for further backpropagation if necessary
 
     @staticmethod
     def sigmoid(x):
+        """Sigmoid activation function."""
         return 1 / (1 + np.exp(-x))
+
+    @staticmethod
+    def sigmoid_derivative(output): # Takes the already calculated output for efficiency
+        """Derivative of the sigmoid function."""
+        return output * (1 - output)
+
+    @staticmethod
+    def relu(x):
+        """ReLU activation function."""
+        return np.maximum(0, x)
+
+    @staticmethod
+    def relu_derivative(output):
+        """Derivative of the ReLU activation function."""
+        return np.where(output > 0, 1, 0)
+
+    def get_weights(self, weight_type):
+        """Returns the specified weights."""
+        return self.weights.get(weight_type)
+
+# Example Usage (demonstrating backpropagation in a simple two-neuron network):
+input_neuron = Neuron(position=(0, 0, 0))
+input_neuron.set_type('input')
+output_neuron = Neuron(position=(1, 0, 0))
+output_neuron.set_type('output')
+
+input_data = np.array([0.5, 0.2, 0.8])
+target_output = 0.7
+
+# Forward pass
+intermediate_output = input_neuron.process_input(input_data)
+final_output = output_neuron.process_input(intermediate_output)
+
+# Calculate initial error
+error = target_output - final_output
+print(f"Initial Error: {error}")
+
+# Backward pass
+output_gradients = output_neuron.backward(error)
+input_neuron.backward(output_gradients)
+
+# Forward pass again to see the effect of backpropagation
+intermediate_output = input_neuron.process_input(input_data)
+final_output = output_neuron.process_input(intermediate_output)
+error = target_output - final_output
+print(f"Error After Backpropagation: {error}")
+print(f"Output Neuron Input Weights: {output_neuron.get_weights('input')}")
+print(f"Input Neuron Input Weights: {input_neuron.get_weights('input')}")
