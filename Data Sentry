@@ -1,0 +1,73 @@
+import ast
+import re
+from typing import List, Dict, Any
+from sklearn.linear_model import LogisticRegression
+import hashlib
+
+# Toy ML Model for Privacy Risk Prediction (trained on synthetic features: pii_count, storage_calls, encryption_usage)
+class PrivacyPredictor:
+    def __init__(self):
+        self.model = LogisticRegression()
+        # Simulated pre-trained weights (in real, train on dataset)
+        self.model.coef_ = np.array([[2.0, 1.5, -3.0]])  # High PII/storage high risk; high encryption low risk
+        self.model.intercept_ = np.array([0.5])
+    
+    def predict(self, features: List[float]) -> float:
+        return self.model.predict_proba([features])[0][1]  # Probability of privacy risk
+
+def extract_features(code_str: str) -> List[float]:
+    """Extract features: pii_count (names/emails), storage_calls (file/db writes), encryption_usage (hash/encrypt calls)."""
+    tree = ast.parse(code_str)
+    pii_count = len(re.findall(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b|\b[\w\.-]+@[\w\.-]+\.\w+\b', code_str))  # Names, emails
+    storage_calls = len([node for node in ast.walk(tree) if isinstance(node, ast.Call) and node.func.attr in ('write', 'save') if hasattr(node.func, 'attr')])
+    encryption_usage = len(re.findall(r'hashlib|cryptography|encrypt', code_str, re.IGNORECASE))
+    return [pii_count, storage_calls, encryption_usage]
+
+def suggest_fix(risk_prob: float, features: List[float]) -> str:
+    """Suggest fixes based on risk probability."""
+    if risk_prob > 0.5:
+        if features[0] > 0:  # High PII
+            return "Anonymize PII: Use hashlib.sha256 for names/emails."
+        if features[1] > 0:  # High storage
+            return "Secure storage: Add cryptography.fernet for encryption."
+        return "Integrate with Prefect: Use DataSentry task to wrap pipeline."
+    return "Code appears privacy-safe!"
+
+def generate_pipeline_fix(code_str: str, fix: str) -> str:
+    """Generate modified pipeline code with fix."""
+    if "Anonymize PII" in fix:
+        return f"from hashlib import sha256\n# {fix}\n{code_str}\n# Example: name = sha256(name.encode()).hexdigest()"
+    if "Secure storage" in fix:
+        return f"from cryptography.fernet import Fernet\n# {fix}\nkey = Fernet.generate_key()\nfernet = Fernet(key)\n{code_str}\n# Example: encrypted_data = fernet.encrypt(data)"
+    return code_str
+
+def datasentry_analyze(code_str: str) -> Dict[str, Any]:
+    """Main function: Analyze code, predict risks, suggest fixes, generate pipeline."""
+    features = extract_features(code_str)
+    predictor = PrivacyPredictor()
+    risk_prob = predictor.predict(features)
+    
+    fix = suggest_fix(risk_prob, features)
+    fixed_code = generate_pipeline_fix(code_str, fix)
+    
+    return {
+        "features": features,
+        "risk_probability": risk_prob,
+        "suggested_fix": fix,
+        "fixed_code": fixed_code
+    }
+
+# Example usage
+if __name__ == "__main__":
+    sample_code = """
+def process_user_data(name, email):
+    with open('user_data.txt', 'w') as f:
+        f.write(f'Name: {name}, Email: {email}')  # PII leak!
+"""
+    
+    result = datasentry_analyze(sample_code)
+    print("DataSentry AI Analysis:")
+    print(f"Features (PII, Storage, Encryption): {result['features']}")
+    print(f"Risk Probability: {result['risk_probability']:.2f}")
+    print(f"Suggested Fix: {result['suggested_fix']}")
+    print(f"Fixed Pipeline Code:\n{result['fixed_code']}")
