@@ -1,0 +1,91 @@
+import ast
+import concurrent.futures
+import torch
+import torch.nn as nn
+import re
+from typing import List, Dict, Any
+
+# Toy ML Model for Bug Prediction (trained on synthetic features: num_shared_vars, lock_usage, thread_count)
+class BugPredictor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(3, 1)  # Input: [shared_vars, locks, threads]; Output: bug_prob (0-1)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        return self.sigmoid(self.fc(x))
+
+# Pre-trained weights (simulated; in real, train on dataset)
+model = BugPredictor()
+model.fc.weight.data = torch.tensor([[ -2.0, 3.0, -1.5 ]])  # High locks low bug; high shared high bug
+model.fc.bias.data = torch.tensor([0.5])
+
+def extract_features(code_str: str) -> List[float]:
+    """Extract features from code: num_shared_vars (global/assign), lock_usage (Lock mentions), thread_count (Thread/ProcessPool)."""
+    tree = ast.parse(code_str)
+    shared_vars = len([node for node in ast.walk(tree) if isinstance(node, ast.Global) or (isinstance(node, ast.Assign) and 'global' in [kw.arg for kw in node.keywords] if hasattr(node, 'keywords') else False)])
+    locks = len(re.findall(r'Lock\s*\(', code_str))
+    threads = len(re.findall(r'Thread|ProcessPoolExecutor', code_str))
+    return [shared_vars, locks, threads]
+
+def simulate_execution(code_str: str) -> Dict[str, Any]:
+    """Simple simulation: Exec code in threads, catch exceptions."""
+    try:
+        exec_globals = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future = executor.submit(exec(code_str, exec_globals))
+            future.result(timeout=5)  # Simulate timeout for hangs
+        return {"status": "safe", "error": None}
+    except Exception as e:
+        return {"status": "buggy", "error": str(e)}
+
+def suggest_fix(bug_prob: float, features: List[float]) -> str:
+    """Suggest fixes based on prediction."""
+    if bug_prob > 0.5:
+        if features[0] > 1:  # High shared vars
+            return "Add locks: from threading import Lock\nlock = Lock()\nwith lock:  # around shared access"
+        if features[2] > 1:  # High threads
+            return "Use concurrent.futures for safer parallelism."
+        return "Rust accel: Use pyo3 to wrap Rust mutex for speed."
+    return "Code looks safe!"
+
+def threadguard_analyze(code_str: str) -> Dict[str, Any]:
+    """Main function: Analyze, predict, simulate, suggest."""
+    features = extract_features(code_str)
+    feat_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+    bug_prob = model(feat_tensor).item()
+    
+    sim_result = simulate_execution(code_str)
+    
+    fix = suggest_fix(bug_prob, features)
+    
+    return {
+        "features": features,
+        "bug_probability": bug_prob,
+        "simulation": sim_result,
+        "suggested_fix": fix
+    }
+
+# Example usage
+if __name__ == "__main__":
+    sample_code = """
+import threading
+global_var = 0  # Shared var, no lock
+
+def increment():
+    global global_var
+    for _ in range(100):
+        global_var += 1  # Race condition!
+
+threads = [threading.Thread(target=increment) for _ in range(10)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(global_var)  # Unpredictable!
+"""
+    
+    result = threadguard_analyze(sample_code)
+    print("ThreadGuard AI Analysis:")
+    print(f"Features: {result['features']}")
+    print(f"Bug Probability: {result['bug_probability']:.2f}")
+    print(f"Simulation: {result['simulation']}")
+    print(f"Suggested Fix: {result['suggested_fix']}")
