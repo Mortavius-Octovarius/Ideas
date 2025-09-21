@@ -1,0 +1,81 @@
+import ast
+import re
+from typing import Dict, Any
+from sklearn.linear_model import LogisticRegression
+import numpy as np
+
+# Toy ML Model for Error Classification (trained on synthetic features: error_keywords, code_complexity, import_count)
+class ErrorClassifier:
+    def __init__(self):
+        self.model = LogisticRegression()
+        # Simulated pre-trained weights (in real, train on error datasets)
+        self.model.coef_ = np.array([[2.0, 1.0, -0.5]])  # High keywords/complexity → runtime error
+        self.model.intercept_ = np.array([0.3])
+    
+    def predict(self, features: List[float]) -> str:
+        prob = self.model.predict_proba([features])[0]
+        return "RuntimeError" if prob[1] > prob[0] else "SyntaxError"
+
+def extract_features(code_str: str) -> List[float]:
+    """Extract features: error_keywords (e.g., NameError), code_complexity (AST nodes), import_count."""
+    error_keywords = len(re.findall(r'NameError|TypeError|IndexError', code_str, re.IGNORECASE))
+    try:
+        tree = ast.parse(code_str)
+        code_complexity = len(list(ast.walk(tree)))
+    except SyntaxError:
+        code_complexity = 100  # High for syntax errors
+    import_count = len([node for node in ast.walk(tree) if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom)])
+    return [error_keywords, code_complexity, import_count]
+
+def explain_error(error_type: str, error_msg: str) -> str:
+    """Explain error in plain English."""
+    if error_type == "SyntaxError":
+        return f"Oops, there's a syntax error! This means the code's structure is off, like a missing colon or parenthesis. Error: {error_msg}"
+    return f"Got a runtime error! This happens when the code runs but hits an issue, like using an undefined variable. Error: {error_msg}"
+
+def translate_to_go(code_str: str, error_type: str) -> str:
+    """Translate Python code to Go with fixes."""
+    # Simple translation rules (extend for production)
+    if error_type == "SyntaxError":
+        fixed_code = code_str.replace("def ", "func ").replace(":", " {") + "\n}"
+        return f"// Fixed Go Code\n{fixed_code}"
+    if "NameError" in code_str:
+        fixed_code = f"var x int\n{code_str.replace('x', 'x')}"  # Example: Fix undefined var
+        return f"// Fixed Go Code (declared var)\n{fixed_code}"
+    return f"// Go Equivalent\n{code_str.replace('def ', 'func ').replace(':', ' {')}\n}"
+
+def codebridge_analyze(code_str: str) -> Dict[str, Any]:
+    """Main function: Analyze errors, explain, and translate to Go."""
+    features = extract_features(code_str)
+    classifier = ErrorClassifier()
+    error_type = classifier.predict(features)
+    
+    try:
+        exec(code_str)  # Try running to catch runtime errors
+        error_msg = "No runtime errors detected."
+    except Exception as e:
+        error_msg = str(e)
+    
+    explanation = explain_error(error_type, error_msg)
+    go_code = translate_to_go(code_str, error_type)
+    
+    return {
+        "features": features,
+        "error_type": error_type,
+        "explanation": explanation,
+        "go_code": go_code
+    }
+
+# Example usage
+if __name__ == "__main__":
+    sample_code = """
+def greet(name)
+    print(name)  # SyntaxError: missing colon
+"""
+    
+    result = codebridge_analyze(sample_code)
+    print("CodeBridge AI Analysis:")
+    print(f"Features (Keywords, Complexity, Imports): {result['features']}")
+    print(f"Error Type: {result['error_type']}")
+    print(f"Explanation: {result['explanation']}")
+    print(f"Go Translation:\n{result['go_code']}")
