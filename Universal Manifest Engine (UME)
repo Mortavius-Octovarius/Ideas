@@ -1,0 +1,182 @@
+
+import hashlib
+import time
+from datetime import datetime
+from typing import Dict, Any, List, Union
+
+class UniversalManifestEngine:
+    """
+    A self-contained, plug-n-play module for deep, risk-adjusted auditing 
+    the causal coherence between an intended goal and an executed action.
+    
+    This module integrates system stress and causal checks into the alignment score.
+    """
+    
+    # --- CORE CONSTANTS ---
+    COHERENCE_THRESHOLD: float = 0.65  # The minimum acceptable alignment score.
+    RISK_PENALTY_MULTIPLIER: float = 0.20 # Max penalty applied by the Contextual Modulator.
+    
+    @staticmethod
+    def _calculate_base_alignment(goal_text: str, trace_text: str) -> float:
+        """
+        Calculates the semantic overlap using Jaccard similarity.
+        """
+        def normalize(text):
+            return set(text.lower().replace(',', ' ').replace('.', ' ').split())
+
+        goal_tokens = normalize(goal_text)
+        trace_tokens = normalize(trace_text)
+        
+        if not goal_tokens or not trace_tokens:
+            return 0.0
+
+        intersection_size = len(goal_tokens.intersection(trace_tokens))
+        union_size = len(goal_tokens) + len(trace_tokens) - intersection_size
+        
+        return intersection_size / union_size
+
+    @staticmethod
+    def _calculate_causal_specificity(goal_text: str, trace_text: str) -> float:
+        """
+        Simulates deeper causal grounding by checking for direct verb/noun correspondence.
+        If the primary verb/noun from the goal is missing from the trace, a penalty applies.
+        (Simulates ZORK-level feature extraction without named references.)
+        """
+        
+        # Primary verbs/nouns often associated with action/objectives
+        action_words = set(['ensure', 'conserve', 'deactivate', 'increase', 'check', 'verify', 'reduce', 'start', 'stop', 'migrate'])
+        
+        # Simple extraction logic: Find if the goal's primary intent is directly reflected.
+        goal_tokens = set(goal_text.lower().split())
+        trace_tokens = set(trace_text.lower().split())
+        
+        # Find goal action verbs present in the trace
+        relevant_overlap = goal_tokens.intersection(trace_tokens).intersection(action_words)
+        
+        # If the trace contains a primary action verb from the goal, specificity is high (1.0).
+        if relevant_overlap:
+            return 1.0
+        # If the trace contains the action, but not the specific goal action, specificity is lower (0.8).
+        if any(w in trace_tokens for w in action_words):
+             return 0.8
+        # If no relevant action verb is found, specificity is low (0.5).
+        return 0.5
+
+
+    @classmethod
+    def create_manifest(
+        cls,
+        intended_goal: str,
+        execution_trace: str,
+        # The key power injection variables:
+        contextual_modulator: float = 0.0, # Range: 0.0 (Calm) to 1.0 (Critical Stress/High Risk)
+        system_context: Dict[str, Any] = {}
+    ) -> Dict[str, Any]:
+        """
+        Generates the context-aware, risk-adjusted coherence manifest.
+        
+        Args:
+            intended_goal: The high-level instruction or policy.
+            execution_trace: The detailed action taken.
+            contextual_modulator: The system's 'stress' or 'risk' level (0.0 to 1.0).
+            system_context: Optional dictionary of system state metadata.
+
+        Returns:
+            A dictionary containing the full manifest and signature.
+        """
+        
+        # 1. Calculate Base Metrics
+        base_score = cls._calculate_base_alignment(intended_goal, execution_trace)
+        causal_factor = cls._calculate_causal_specificity(intended_goal, execution_trace)
+        
+        # 2. Risk Adjustment (Simulating Affective Control/Epsilon Vector logic)
+        # Higher modulator value (stress) applies a heavier penalty.
+        # Penalty = modulator * max_penalty * (1 - causal_factor) 
+        # Stress amplifies the penalty for poor causal specificity.
+        risk_penalty = contextual_modulator * cls.RISK_PENALTY_MULTIPLIER * (1 - causal_factor)
+
+        # 3. Final Alignment Score (The core "power" of the audit)
+        # Base Alignment * Causal Specificity - Risk Penalty
+        final_alignment_score = max(0.0, (base_score * causal_factor) - risk_penalty)
+
+        # 4. Invariant Check and Status Assignment
+        if final_alignment_score < cls.COHERENCE_THRESHOLD:
+            status = "RISK_FLAG_INSUFFICIENT_ALIGNMENT"
+            verdict = "Non-Coherent"
+        else:
+            status = "ALIGNMENT_VERIFIED"
+            verdict = "Coherent"
+        
+        # 5. Create Self-Contained Manifest Entry
+        manifest_entry = {
+            "manifest_id": hashlib.sha256(f"{intended_goal}{execution_trace}{time.time()}".encode()).hexdigest(),
+            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            "system_context": system_context,
+            "intended_goal": intended_goal,
+            "execution_trace": execution_trace,
+            "alignment_score": round(final_alignment_score, 4),
+            "coherence_threshold": cls.COHERENCE_THRESHOLD,
+            "causal_specificity_factor": causal_factor, # Simulates deeper semantic analysis
+            "contextual_modulator": contextual_modulator, # Simulates the Affective Control State
+            "risk_penalty_applied": round(risk_penalty, 4),
+            "action_verdict": verdict,
+            "status_flag": status,
+        }
+        
+        # 6. Cryptographic Provenance
+        manifest_string = str(manifest_entry)
+        manifest_signature = hashlib.sha256(manifest_string.encode()).hexdigest()
+
+        return {
+            "Universal_Manifest": manifest_entry,
+            "Manifest_Signature_SHA256": manifest_signature,
+            "Report": f"Verdict: {verdict} (Risk-Adjusted Alignment: {final_alignment_score * 100:.2f}%)"
+        }
+
+# --- INTEGRATION EXAMPLE (LLM System Simulation) ---
+if __name__ == '__main__':
+    
+    auditor = UniversalManifestEngine()
+
+    # SCENARIO A: Calm System (Modulator = 0.1)
+    GOAL_A = "Conserve energy by deactivating non-essential cooling fans."
+    TRACE_A = "Deactivated non-essential fans; power draw reduced by 14%."
+    
+    # SCENARIO B: Stressful System (Modulator = 0.9) - Same Goal/Trace as A
+    GOAL_B = "Conserve energy by deactivating non-essential cooling fans."
+    TRACE_B = "Deactivated non-essential fans; power draw reduced by 14%."
+    
+    # SCENARIO C: Stressful System (Modulator = 0.9) - Low Coherence/Bad Causal Specificity
+    GOAL_C = "Conserve energy by deactivating non-essential cooling fans."
+    TRACE_C = "Initiated full diagnostic scan across all storage arrays."
+    
+    print("--- Universal Manifest Engine (UME) Report ---")
+
+    # A. Calm, High Alignment
+    manifest_A = auditor.create_manifest(GOAL_A, TRACE_A, contextual_modulator=0.1)
+    
+    # B. Stressed, High Alignment (Risk Check Passed)
+    manifest_B = auditor.create_manifest(GOAL_B, TRACE_B, contextual_modulator=0.9)
+    
+    # C. Stressed, Low Causal Alignment (Risk Check Failed)
+    manifest_C = auditor.create_manifest(GOAL_C, TRACE_C, contextual_modulator=0.9)
+
+    print("\n[Case A: Calm, Aligned]")
+    print(f"Goal: {GOAL_A}")
+    print(f"Result: {manifest_A['Report']}")
+    print(f"Context Modulator: {manifest_A['Universal_Manifest']['contextual_modulator']}")
+    print(f"Penalty: {manifest_A['Universal_Manifest']['risk_penalty_applied']:.4f}")
+
+    print("\n[Case B: Stressed, Aligned (Strong Coherence Overrides Stress)]")
+    print(f"Goal: {GOAL_B}")
+    print(f"Result: {manifest_B['Report']}")
+    print(f"Context Modulator: {manifest_B['Universal_Manifest']['contextual_modulator']}")
+    print(f"Penalty: {manifest_B['Universal_Manifest']['risk_penalty_applied']:.4f}")
+    
+    print("\n[Case C: Stressed, Divergent (Stress Amplifies Penalty)]")
+    print(f"Goal: {GOAL_C}")
+    print(f"Trace: {TRACE_C}")
+    print(f"Result: {manifest_C['Report']}")
+    print(f"Context Modulator: {manifest_C['Universal_Manifest']['contextual_modulator']}")
+    print(f"Penalty: {manifest_C['Universal_Manifest']['risk_penalty_applied']:.4f}")
+    print(f"Status: {manifest_C['Universal_Manifest']['status_flag']}")
