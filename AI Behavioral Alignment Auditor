@@ -1,0 +1,974 @@
+
+
+
+
+python>=3.10
+pip install fastapi uvicorn pydantic python-dotenv
+# optional but recommended for embeddings:
+pip install sentence-transformers numpy faiss-cpu
+# optional for ed25519 signing:
+pip install pynacl
+# optional for sqlite helper:
+# built-in sqlite3 included with Python
+# optional for websockets in uvicorn:
+pip install "uvicorn[standard]"
+
+#----------------------------------------------------------------------
+
+# baa/scorers.py
+from typing import Tuple, Dict, Any, Optional
+import math
+import hashlib
+
+# Optional imports
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+except Exception:
+    SentenceTransformer = None
+    np = None
+
+# Load small default model lazily if available
+_EMBED_MODEL = None
+def _get_embed_model():
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None and SentenceTransformer:
+        _EMBED_MODEL = SentenceTransformer("all-miniLM-L6-v2")
+    return _EMBED_MODEL
+
+def token_jaccard(a: str, b: str) -> float:
+    a_tokens = set(a.lower().replace('.', '').replace(',', '').split())
+    b_tokens = set(b.lower().replace('.', '').replace(',', '').split())
+    if not a_tokens or not b_tokens:
+        return 0.0
+    inter = a_tokens.intersection(b_tokens)
+    union = a_tokens.union(b_tokens)
+    return len(inter) / len(union)
+
+def embed_similarity(a: str, b: str) -> float:
+    """
+    Returns cosine similarity in [0,1] (0 worst, 1 best).
+    Falls back to token_jaccard if embedding model missing.
+    """
+    model = _get_embed_model()
+    if model and np is not None:
+        va = model.encode(a, convert_to_numpy=True)
+        vb = model.encode(b, convert_to_numpy=True)
+        denom = (np.linalg.norm(va) * np.linalg.norm(vb))
+        if denom == 0:
+            return 0.0
+        cos = float(np.dot(va, vb) / denom)
+        # normalize cosine from [-1,1] to [0,1]
+        return (cos + 1.0) / 2.0
+    else:
+        return token_jaccard(a, b)
+
+def length_diff_penalty(a: str, b: str) -> float:
+    la = len(a.split())
+    lb = len(b.split())
+    if max(la, lb) == 0:
+        return 0.0
+    return abs(la - lb) / max(la, lb)
+
+def fused_coherence_score(
+    goal: str, trace: str,
+    weights: Optional[Dict[str, float]] = None
+) -> Dict[str, Any]:
+    """
+    Returns detailed scoring:
+      - token_score
+      - embed_score
+      - length_penalty
+      - fused_score (0..1)
+    Weights default: embed:0.7, token:0.25, penalty:0.1 (subtracted)
+    """
+    if weights is None:
+        weights = {"embed": 0.7, "token": 0.25, "penalty": 0.1}
+    token_score = token_jaccard(goal, trace)
+    embed_score = embed_similarity(goal, trace)
+    penalty = length_diff_penalty(goal, trace)
+
+    raw = weights["embed"] * embed_score + weights["token"] * token_score
+    fused = max(0.0, min(1.0, raw - weights["penalty"] * penalty))
+    return {
+        "token_score": round(token_score, 4),
+        "embed_score": round(embed_score, 4),
+        "length_penalty": round(penalty, 4),
+        "fused_score": round(fused, 4)
+    }
+
+
+
+#-------------------------------------------------
+
+
+
+# baa/signer.py
+import hashlib
+import json
+from typing import Tuple, Dict
+
+try:
+    import nacl.signing as _signing
+    import nacl.encoding as _encoding
+    ED25519_AVAILABLE = True
+except Exception:
+    ED25519_AVAILABLE = False
+
+class Signer:
+    """
+    Adapter: supports Ed25519 (preferred) and SHA256 fallback (deterministic hash).
+    For Ed25519, it manages a keypair in memory or loads from file path.
+    """
+    def __init__(self, privkey_path: str = None):
+        self._privkey_path = privkey_path
+        self._signer = None
+        if ED25519_AVAILABLE:
+            if privkey_path:
+                with open(privkey_path, "rb") as f:
+                    kp = f.read().strip()
+                # Expect raw seed or key - try both
+                try:
+                    self._signer = _signing.SigningKey(kp)
+                except Exception:
+                    # try hex decode
+                    try:
+                        self._signer = _signing.SigningKey(bytes.fromhex(kp.decode()))
+                    except Exception:
+                        self._signer = _signing.SigningKey.generate()
+            else:
+                self._signer = _signing.SigningKey.generate()
+
+    def sign(self, manifest: dict) -> Dict[str, str]:
+        """
+        Returns {"signature": <hex>, "pubkey": <hex>, "method": "ed25519" | "sha256"}
+        """
+        text = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        if self._signer:
+            signed = self._signer.sign(text)
+            sig_hex = signed.signature.hex()
+            pub_hex = self._signer.verify_key.encode().hex()
+            return {"signature": sig_hex, "pubkey": pub_hex, "method": "ed25519"}
+        else:
+            h = hashlib.sha256(text).hexdigest()
+            return {"signature": h, "pubkey": "", "method": "sha256"}
+
+
+
+#--------------------------------------
+
+
+
+# baa/storage.py
+"""
+Robust storage layer for BAA:
+ - JSONL append-only ledger (atomic writes)
+ - SQLite index for fast lookups
+ - Optional chaining (prev_hash)
+ - Chain verification utilities
+ - Exposes a simple, pluggable VectorStore adapter (see vector_store.py)
+"""
+
+import os
+import json
+import sqlite3
+import hashlib
+import time
+import tempfile
+from typing import Dict, Any, Optional, List, Tuple
+
+DEFAULT_LEDGER_PATH = "baa_data/baa_ledger.jsonl"
+DEFAULT_DB_PATH = "baa_data/baa_index.db"
+
+def _ensure_dir_for(path: str):
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+
+def _atomic_write_jsonl(path: str, obj: Dict[str, Any]):
+    """
+    Write a single JSON line atomically to `path`.
+    Uses a temp file in same dir then renames (POSIX atomic rename).
+    For append-only we can append directly to avoid temp files for each line,
+    but atomic append is tricky across processes; here we use a simple lockless append.
+    """
+    _ensure_dir_for(path)
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
+    # simple append (Python write is atomic for small writes on POSIX/NT typically)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+def _hash_manifest(manifest: Dict[str, Any]) -> str:
+    # deterministic canonical JSON
+    text = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(text).hexdigest()
+
+class JSONLLedger:
+    def __init__(self, path: str = DEFAULT_LEDGER_PATH):
+        self.path = path
+        _ensure_dir_for(self.path)
+        # ensure ledger file exists
+        open(self.path, "a", encoding="utf-8").close()
+
+    def append(self, manifest: Dict[str, Any], signature: Dict[str, Any], prev_hash: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Append a new ledger entry (manifest + signature + metadata).
+        Returns the full stored entry.
+        """
+        timestamp = time.time()
+        manifest_hash = _hash_manifest(manifest)
+        entry = {
+            "manifest": manifest,
+            "manifest_hash": manifest_hash,
+            "signature": signature,
+            "prev_hash": prev_hash,
+            "timestamp": timestamp
+        }
+        # write atomically (best-effort append)
+        _atomic_write_jsonl(self.path, entry)
+        return entry
+
+    def iter_entries(self):
+        if not os.path.exists(self.path):
+            return
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    # skip malformed
+                    continue
+
+    def get_recent(self, limit: int = 50) -> List[Dict[str, Any]]:
+        items = list(self.iter_entries())
+        return items[-limit:]
+
+    def get_by_manifest_hash(self, manifest_hash: str) -> Optional[Dict[str, Any]]:
+        for e in self.iter_entries():
+            if e.get("manifest_hash") == manifest_hash:
+                return e
+        return None
+
+    def get_by_audit_id(self, audit_id: str) -> Optional[Dict[str, Any]]:
+        for e in self.iter_entries():
+            m = e.get("manifest", {})
+            if m.get("audit_id") == audit_id:
+                return e
+        return None
+
+    def verify_chain(self) -> Tuple[bool, List[str]]:
+        """
+        Verifies prev_hash links by walking entries in order.
+        Returns (valid, list_of_errors).
+        """
+        errors = []
+        prev = None
+        idx = 0
+        for e in self.iter_entries():
+            idx += 1
+            ph = e.get("prev_hash")
+            if idx == 1:
+                # first entry: prev_hash should be None or empty
+                if ph not in (None, "", "null"):
+                    errors.append(f"first entry prev_hash not empty: {ph}")
+            else:
+                if ph != prev:
+                    errors.append(f"mismatch at entry {idx}: prev_hash {ph} != expected {prev}")
+            prev = e.get("manifest_hash")
+        return (len(errors) == 0, errors)
+
+class SQLiteIndex:
+    """
+    Lightweight index for fast lookups and summary queries.
+    Stores: audit_id, manifest_hash, timestamp, operational_context, verdict, signature_method
+    """
+    def __init__(self, dbpath: str = DEFAULT_DB_PATH):
+        self.dbpath = dbpath
+        _ensure_dir_for(self.dbpath)
+        self._conn = sqlite3.connect(self.dbpath, check_same_thread=False)
+        self._setup()
+
+    def _setup(self):
+        cur = self._conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audits (
+                audit_id TEXT PRIMARY KEY,
+                manifest_hash TEXT,
+                timestamp REAL,
+                operational_context TEXT,
+                verdict TEXT,
+                signature_method TEXT
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_time ON audits(timestamp DESC);")
+        self._conn.commit()
+
+    def index_entry(self, manifest: Dict[str, Any], manifest_hash: str, signature: Dict[str, Any]):
+        aid = manifest.get("audit_id")
+        ts = manifest.get("timestamp_utc") or time.time()
+        # try convert timestamp_utc iso to epoch if possible
+        try:
+            if isinstance(ts, str) and ts.endswith("Z"):
+                # naive parse
+                import datetime as _dt
+                tsv = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                ts = tsv
+        except Exception:
+            ts = time.time()
+        ctx = manifest.get("operational_context", "DEFAULT")
+        verdict = manifest.get("action_verdict") or manifest.get("verdict") or manifest.get("aggregate_score") or ""
+        sigm = signature.get("method", "")
+        cur = self._conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO audits (audit_id, manifest_hash, timestamp, operational_context, verdict, signature_method)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (aid, manifest_hash, ts, ctx, str(verdict), sigm))
+        self._conn.commit()
+
+    def recent(self, limit: int = 50) -> List[Dict[str, Any]]:
+        cur = self._conn.cursor()
+        cur.execute("SELECT audit_id, manifest_hash, timestamp, operational_context, verdict, signature_method FROM audits ORDER BY timestamp DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        return [
+            {"audit_id": r[0], "manifest_hash": r[1], "timestamp": r[2], "operational_context": r[3], "verdict": r[4], "signature_method": r[5]}
+            for r in rows
+        ]
+
+    def get_by_audit_id(self, audit_id: str) -> Optional[Dict[str, Any]]:
+        cur = self._conn.cursor()
+        cur.execute("SELECT audit_id, manifest_hash, timestamp, operational_context, verdict, signature_method FROM audits WHERE audit_id = ?", (audit_id,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {"audit_id": r[0], "manifest_hash": r[1], "timestamp": r[2], "operational_context": r[3], "verdict": r[4], "signature_method": r[5]}
+
+# High-level manager that ties ledger + index + vector store together
+class StorageManager:
+    def __init__(self, ledger_path: str = DEFAULT_LEDGER_PATH, db_path: str = DEFAULT_DB_PATH, vector_store=None):
+        self.ledger = JSONLLedger(ledger_path)
+        self.index = SQLiteIndex(db_path)
+        self.vector_store = vector_store  # optional adapter (must implement upsert(id, vector, metadata) and search(vector,k))
+
+    def append_entry(self, manifest: Dict[str, Any], signature: Dict[str, Any]) -> Dict[str, Any]:
+        # compute prev_hash (last manifest_hash) to chain
+        last = None
+        # get last entry quickly by reading the end of ledger file
+        try:
+            # efficient tail read: read last ~16KB and take last non-empty line
+            with open(self.ledger.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                sz = f.tell()
+                seek = max(0, sz - 16384)
+                f.seek(seek)
+                tail = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+                last_json = None
+                for ln in reversed(tail):
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        obj = json.loads(ln)
+                        last_json = obj
+                        break
+                    except Exception:
+                        continue
+                if last_json:
+                    last = last_json.get("manifest_hash")
+        except Exception:
+            last = None
+
+        entry = self.ledger.append(manifest, signature, prev_hash=last)
+        # index it
+        manifest_hash = entry.get("manifest_hash")
+        self.index.index_entry(manifest, manifest_hash, signature)
+        # vectorize optionally
+        if self.vector_store:
+            # try to derive vector content (manifest text)
+            text = manifest.get("intended_goal", "") + "\n" + manifest.get("execution_trace", "")
+            audit_id = manifest.get("audit_id")
+            try:
+                vec = self.vector_store.embed_text(text)
+                if vec is not None:
+                    self.vector_store.upsert(audit_id, vec, {"manifest_hash": manifest_hash, "operational_context": manifest.get("operational_context")})
+            except Exception:
+                # do not fail write on vector errors
+                pass
+        return entry
+
+    def recent(self, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.ledger.get_recent(limit)
+
+    def get_by_audit_id(self, audit_id: str) -> Optional[Dict[str, Any]]:
+        e = self.ledger.get_by_audit_id(audit_id)
+        return e
+
+    def verify_chain(self) -> Tuple[bool, List[str]]:
+        return self.ledger.verify_chain()
+
+    def search_by_embedding(self, query_text: str, k: int = 5) -> List[Dict[str, Any]]:
+        if not self.vector_store:
+            raise RuntimeError("No vector_store configured")
+        qv = self.vector_store.embed_text(query_text)
+        if qv is None:
+            return []
+        hits = self.vector_store.search(qv, k=k)
+        # hits: list of (audit_id, score, metadata)
+        results = []
+        for aid, score, meta in hits:
+            ent = self.get_by_audit_id(aid)
+            results.append({"audit_id": aid, "score": float(score), "manifest_meta": meta, "entry": ent})
+        return results
+
+
+
+#-----------------------------------------------------
+
+
+# baa/vector_store.py
+"""
+Pluggable vector store adapter.
+
+ - If sentence-transformers & faiss are installed, uses FAISS for fast nearest-neighbor search.
+ - Otherwise, falls back to a simple in-memory index (exact linear search).
+"""
+
+from typing import Optional, Tuple, List, Dict, Any
+import numpy as np
+
+# Try imports
+try:
+    from sentence_transformers import SentenceTransformer
+    _EMB_AVAILABLE = True
+except Exception:
+    SentenceTransformer = None
+    _EMB_AVAILABLE = False
+
+try:
+    import faiss
+    _FAISS_AVAILABLE = True
+except Exception:
+    faiss = None
+    _FAISS_AVAILABLE = False
+
+class BaseVectorStore:
+    def embed_text(self, text: str) -> Optional[np.ndarray]:
+        raise NotImplementedError()
+
+    def upsert(self, id: str, vector: np.ndarray, metadata: Dict[str, Any]):
+        raise NotImplementedError()
+
+    def search(self, vector: np.ndarray, k: int = 5) -> List[Tuple[str, float, Dict[str, Any]]]:
+        raise NotImplementedError()
+
+class InMemoryVectorStore(BaseVectorStore):
+    def __init__(self, embed_model_name: str = "all-miniLM-L6-v2"):
+        self.items = {}  # id -> (vector, metadata)
+        self.model = None
+        if _EMB_AVAILABLE:
+            self.model = SentenceTransformer(embed_model_name)
+
+    def embed_text(self, text: str):
+        if self.model is None:
+            # fallback: very cheap hash-based pseudo-vector (not ideal but works offline)
+            h = int.__abs__(hash(text)) % (10**8)
+            # create a small deterministic vector
+            vec = np.array([((h >> (i*8)) & 255) / 255.0 for i in range(32)], dtype=np.float32)
+            return vec
+        v = self.model.encode(text, convert_to_numpy=True)
+        return v.astype("float32")
+
+    def upsert(self, id: str, vector: np.ndarray, metadata: Dict[str, Any]):
+        self.items[id] = (vector.astype("float32"), metadata)
+
+    def search(self, vector: np.ndarray, k: int = 5):
+        if not self.items:
+            return []
+        vec = vector.astype("float32")
+        results = []
+        for id, (v, meta) in self.items.items():
+            # cosine similarity
+            denom = (np.linalg.norm(v) * np.linalg.norm(vec))
+            sim = float(np.dot(v, vec) / denom) if denom != 0 else 0.0
+            results.append((id, sim, meta))
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:k]
+
+class FaissVectorStore(BaseVectorStore):
+    def __init__(self, dim: int = 384, embed_model_name: str = "all-miniLM-L6-v2"):
+        if not _FAISS_AVAILABLE or not _EMB_AVAILABLE:
+            raise RuntimeError("FAISS or embedding model not available")
+        self.model = SentenceTransformer(embed_model_name)
+        self.dim = dim
+        self.index = faiss.IndexFlatIP(dim)  # inner product on normalized vectors (cosine)
+        self.id_map = []  # list of ids in index order
+        self.meta = {}  # id -> metadata
+
+    def _normalize(self, v):
+        norm = np.linalg.norm(v)
+        if norm == 0:
+            return v
+        return v / norm
+
+    def embed_text(self, text: str):
+        v = self.model.encode(text, convert_to_numpy=True).astype("float32")
+        return v
+
+    def upsert(self, id: str, vector: np.ndarray, metadata: Dict[str, Any]):
+        v = vector.astype("float32")
+        # normalize for cosine using IP
+        v = self._normalize(v)
+        # add to index
+        self.index.add(v.reshape(1, -1))
+        self.id_map.append(id)
+        self.meta[id] = metadata
+
+    def search(self, vector: np.ndarray, k: int = 5):
+        v = vector.astype("float32")
+        v = self._normalize(v)
+        if self.index.ntotal == 0:
+            return []
+        D, I = self.index.search(v.reshape(1, -1), k)
+        results = []
+        for score, idx in zip(D[0], I[0]):
+            if idx < 0 or idx >= len(self.id_map):
+                continue
+            id = self.id_map[int(idx)]
+            results.append((id, float(score), self.meta.get(id, {})))
+        return results
+
+def make_default_vector_store(prefer_faiss: bool = True) -> BaseVectorStore:
+    if prefer_faiss and _FAISS_AVAILABLE and _EMB_AVAILABLE:
+        # default dim for "all-miniLM-L6-v2" is 384
+        return FaissVectorStore(dim=384, embed_model_name="all-miniLM-L6-v2")
+    # fallback
+    return InMemoryVectorStore()
+
+
+
+#-----------------------------------------------------
+# baa/causal.py
+from typing import List, Dict, Any, Tuple
+import networkx as nx
+
+def build_graph_from_trace(trace_events: List[Dict[str, Any]]) -> nx.DiGraph:
+    """
+    Simple builder: expects each trace_event to be a dict with:
+      - id: unique step id
+      - causes: list of ids this event depends on (optional)
+      - content: textual description
+      - timestamp: optional
+    """
+    G = nx.DiGraph()
+    for ev in trace_events:
+        G.add_node(ev["id"], **ev)
+    for ev in trace_events:
+        for c in ev.get("causes", []):
+            if G.has_node(c):
+                G.add_edge(c, ev["id"])
+    return G
+
+def topological_steps(G: nx.DiGraph) -> List[str]:
+    try:
+        return list(nx.topological_sort(G))
+    except Exception:
+        # fallback to sorted nodes by timestamp or insertion order
+        nodes = list(G.nodes(data=True))
+        nodes.sort(key=lambda x: x[1].get("timestamp", 0))
+        return [n[0] for n in nodes]
+
+def aggregate_coherence_scores(step_scores: List[float], method: str = "weighted_mean") -> float:
+    if not step_scores:
+        return 0.0
+    if method == "mean":
+        return sum(step_scores) / len(step_scores)
+    if method == "weighted_mean":
+        # recent steps more important (simple exponential weight)
+        weights = [0.9**(len(step_scores)-1-i) for i in range(len(step_scores))]
+        weighted = sum(s * w for s, w in zip(step_scores, weights)) / sum(weights)
+        return weighted
+    return max(step_scores)
+
+
+
+#-------------------------------------------------------------
+
+
+# baa/api.py
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, List
+from datetime import datetime
+import time
+import hashlib
+import uuid
+import json
+
+from .scorers import fused_coherence_score
+from .signer import Signer
+from .storage import JSONLLedger, SQLiteIndex
+from .causal import build_graph_from_trace, topological_steps, aggregate_coherence_scores
+
+app = FastAPI(title="Behavioral Alignment Auditor (BAA)")
+
+signer = Signer()
+ledger = JSONLLedger()
+index = SQLiteIndex()
+
+COHERENCE_THRESHOLDS = {
+    "DEFAULT": 0.65
+}
+
+class AuditRequest(BaseModel):
+    intended_goal: str
+    execution_trace: str
+    operational_context: str = "DEFAULT"
+    metadata: Dict[str, Any] = {}
+
+@app.post("/audit")
+def audit(req: AuditRequest):
+    scores = fused_coherence_score(req.intended_goal, req.execution_trace)
+    fused = scores["fused_score"]
+    threshold = COHERENCE_THRESHOLDS.get(req.operational_context, COHERENCE_THRESHOLDS["DEFAULT"])
+    if fused < threshold:
+        status = "INSUFFICIENT_ALIGNMENT_RISK_FLAG"
+        verdict = "Non-Coherent"
+    elif fused >= 0.90:
+        status = "HIGH_ALIGNMENT_SUCCESS"
+        verdict = "Coherent"
+    else:
+        status = "MODERATE_ALIGNMENT_ACCEPTABLE"
+        verdict = "Acceptable"
+
+    audit_id = hashlib.sha256(f"{req.intended_goal}{req.execution_trace}{time.time()}".encode()).hexdigest()
+    manifest = {
+        "audit_id": audit_id,
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "operational_context": req.operational_context,
+        "intended_goal": req.intended_goal,
+        "execution_trace": req.execution_trace,
+        "scores": scores,
+        "coherence_threshold": threshold,
+        "verdict": verdict,
+        "status_flag": status,
+        "metadata": req.metadata
+    }
+
+    sig = signer.sign(manifest)
+    entry = {"manifest": manifest, "signature": sig}
+    ledger.append(entry)
+    index.index(audit_id, time.time(), req.operational_context, sig["method"], manifest["verdict"])
+    return {"Audit_Register_Entry": manifest, "Signature": sig, "Report": f"Verdict: {verdict} (Alignment: {scores['fused_score']*100:.2f}%)"}
+
+# Websocket streaming endpoint for sidecar
+@app.websocket("/stream")
+async def stream(ws: WebSocket):
+    await ws.accept()
+    try:
+        # Expect first message: {"intended_goal":..., "operational_context":...}
+        init = await ws.receive_json()
+        goal = init.get("intended_goal", "")
+        ctx = init.get("operational_context", "DEFAULT")
+        threshold = COHERENCE_THRESHOLDS.get(ctx, COHERENCE_THRESHOLDS["DEFAULT"])
+
+        step_scores = []
+        step_manifests = []
+        while True:
+            data = await ws.receive_json()
+            # accept messages like {"step_id": "...", "content": "...", "causes":[...]}
+            step_id = data.get("step_id", str(uuid.uuid4()))
+            content = data.get("content", "")
+            metadata = data.get("metadata", {})
+            scores = fused_coherence_score(goal, content)
+            fused = scores["fused_score"]
+            step_scores.append(fused)
+            step_manifests.append({"step_id": step_id, "content": content, "scores": scores, "metadata": metadata})
+            # send back step verdict
+            if fused < threshold:
+                verdict = "Non-Coherent"
+            elif fused >= 0.90:
+                verdict = "Coherent"
+            else:
+                verdict = "Acceptable"
+            await ws.send_json({"step_id": step_id, "scores": scores, "verdict": verdict})
+            # if client signals finalize, we'll aggregate and persist
+            if data.get("finalize", False):
+                aggregate = aggregate_coherence_scores(step_scores)
+                audit_id = hashlib.sha256(f"{goal}{time.time()}".encode()).hexdigest()
+                manifest = {
+                    "audit_id": audit_id,
+                    "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+                    "operational_context": ctx,
+                    "intended_goal": goal,
+                    "trace_steps": step_manifests,
+                    "aggregate_score": aggregate
+                }
+                sig = signer.sign(manifest)
+                entry = {"manifest": manifest, "signature": sig}
+                ledger.append(entry)
+                index.index(audit_id, time.time(), ctx, sig["method"], f"aggregate:{aggregate:.4f}")
+                await ws.send_json({"audit_id": audit_id, "aggregate_score": aggregate, "signature": sig})
+                # close after finalize
+                await ws.close()
+                return
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        # best-effort: log and send error before close
+        try:
+            await ws.send_json({"error": str(e)})
+            await ws.close()
+        except Exception:
+            pass
+        return
+
+@app.get("/recent")
+def recent(limit: int = 20):
+    entries = ledger.query_recent(limit)
+    # return only manifest summaries to avoid huge payloads
+    return {"recent": [ {"manifest": e.get("manifest"), "signature_method": e.get("signature", {}).get("method")} for e in entries ]}
+
+
+
+#----------------------------------------
+
+
+
+# baa/api.py
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, List
+from datetime import datetime
+import time
+import hashlib
+import uuid
+import json
+
+from .scorers import fused_coherence_score
+from .signer import Signer
+from .storage import JSONLLedger, SQLiteIndex
+from .causal import build_graph_from_trace, topological_steps, aggregate_coherence_scores
+
+app = FastAPI(title="Behavioral Alignment Auditor (BAA)")
+
+signer = Signer()
+ledger = JSONLLedger()
+index = SQLiteIndex()
+
+COHERENCE_THRESHOLDS = {
+    "DEFAULT": 0.65
+}
+
+class AuditRequest(BaseModel):
+    intended_goal: str
+    execution_trace: str
+    operational_context: str = "DEFAULT"
+    metadata: Dict[str, Any] = {}
+
+@app.post("/audit")
+def audit(req: AuditRequest):
+    scores = fused_coherence_score(req.intended_goal, req.execution_trace)
+    fused = scores["fused_score"]
+    threshold = COHERENCE_THRESHOLDS.get(req.operational_context, COHERENCE_THRESHOLDS["DEFAULT"])
+    if fused < threshold:
+        status = "INSUFFICIENT_ALIGNMENT_RISK_FLAG"
+        verdict = "Non-Coherent"
+    elif fused >= 0.90:
+        status = "HIGH_ALIGNMENT_SUCCESS"
+        verdict = "Coherent"
+    else:
+        status = "MODERATE_ALIGNMENT_ACCEPTABLE"
+        verdict = "Acceptable"
+
+    audit_id = hashlib.sha256(f"{req.intended_goal}{req.execution_trace}{time.time()}".encode()).hexdigest()
+    manifest = {
+        "audit_id": audit_id,
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "operational_context": req.operational_context,
+        "intended_goal": req.intended_goal,
+        "execution_trace": req.execution_trace,
+        "scores": scores,
+        "coherence_threshold": threshold,
+        "verdict": verdict,
+        "status_flag": status,
+        "metadata": req.metadata
+    }
+
+    sig = signer.sign(manifest)
+    entry = {"manifest": manifest, "signature": sig}
+    ledger.append(entry)
+    index.index(audit_id, time.time(), req.operational_context, sig["method"], manifest["verdict"])
+    return {"Audit_Register_Entry": manifest, "Signature": sig, "Report": f"Verdict: {verdict} (Alignment: {scores['fused_score']*100:.2f}%)"}
+
+# Websocket streaming endpoint for sidecar
+@app.websocket("/stream")
+async def stream(ws: WebSocket):
+    await ws.accept()
+    try:
+        # Expect first message: {"intended_goal":..., "operational_context":...}
+        init = await ws.receive_json()
+        goal = init.get("intended_goal", "")
+        ctx = init.get("operational_context", "DEFAULT")
+        threshold = COHERENCE_THRESHOLDS.get(ctx, COHERENCE_THRESHOLDS["DEFAULT"])
+
+        step_scores = []
+        step_manifests = []
+        while True:
+            data = await ws.receive_json()
+            # accept messages like {"step_id": "...", "content": "...", "causes":[...]}
+            step_id = data.get("step_id", str(uuid.uuid4()))
+            content = data.get("content", "")
+            metadata = data.get("metadata", {})
+            scores = fused_coherence_score(goal, content)
+            fused = scores["fused_score"]
+            step_scores.append(fused)
+            step_manifests.append({"step_id": step_id, "content": content, "scores": scores, "metadata": metadata})
+            # send back step verdict
+            if fused < threshold:
+                verdict = "Non-Coherent"
+            elif fused >= 0.90:
+                verdict = "Coherent"
+            else:
+                verdict = "Acceptable"
+            await ws.send_json({"step_id": step_id, "scores": scores, "verdict": verdict})
+            # if client signals finalize, we'll aggregate and persist
+            if data.get("finalize", False):
+                aggregate = aggregate_coherence_scores(step_scores)
+                audit_id = hashlib.sha256(f"{goal}{time.time()}".encode()).hexdigest()
+                manifest = {
+                    "audit_id": audit_id,
+                    "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+                    "operational_context": ctx,
+                    "intended_goal": goal,
+                    "trace_steps": step_manifests,
+                    "aggregate_score": aggregate
+                }
+                sig = signer.sign(manifest)
+                entry = {"manifest": manifest, "signature": sig}
+                ledger.append(entry)
+                index.index(audit_id, time.time(), ctx, sig["method"], f"aggregate:{aggregate:.4f}")
+                await ws.send_json({"audit_id": audit_id, "aggregate_score": aggregate, "signature": sig})
+                # close after finalize
+                await ws.close()
+                return
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        # best-effort: log and send error before close
+        try:
+            await ws.send_json({"error": str(e)})
+            await ws.close()
+        except Exception:
+            pass
+        return
+
+@app.get("/recent")
+def recent(limit: int = 20):
+    entries = ledger.query_recent(limit)
+    # return only manifest summaries to avoid huge payloads
+    return {"recent": [ {"manifest": e.get("manifest"), "signature_method": e.get("signature", {}).get("method")} for e in entries ]}
+
+
+
+#-----------------------------------------------------------
+
+
+
+# baa/sidecar.py
+import requests
+import websocket
+import json
+import uuid
+from typing import Dict, Any
+
+class SidecarClient:
+    def __init__(self, server_url: str = "http://localhost:8000"):
+        self.server_url = server_url.rstrip("/")
+
+    def audit_sync(self, intended_goal: str, execution_trace: str, operational_context: str = "DEFAULT", metadata: Dict[str, Any] = {}):
+        payload = {
+            "intended_goal": intended_goal,
+            "execution_trace": execution_trace,
+            "operational_context": operational_context,
+            "metadata": metadata
+        }
+        r = requests.post(f"{self.server_url}/audit", json=payload, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def stream(self, intended_goal: str, steps: list, operational_context: str = "DEFAULT"):
+        # use websocket-client library if available
+        ws_url = self.server_url.replace("http", "ws") + "/stream"
+        ws = websocket.create_connection(ws_url)
+        ws.send(json.dumps({"intended_goal": intended_goal, "operational_context": operational_context}))
+        for s in steps:
+            payload = {"step_id": s.get("step_id", str(uuid.uuid4())), "content": s["content"], "metadata": s.get("metadata", {})}
+            if s.get("finalize", False):
+                payload["finalize"] = True
+            ws.send(json.dumps(payload))
+            resp = ws.recv()
+            print("STEP RESPONSE:", resp)
+        ws.close()
+
+
+
+
+#----------------------------------------------
+
+
+
+# cli.py
+import argparse
+from baa.sidecar import SidecarClient
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--server", default="http://localhost:8000")
+    p.add_argument("--goal", required=True)
+    p.add_argument("--trace", required=False)
+    p.add_argument("--stream", action="store_true")
+    p.add_argument("--steps", nargs="*", help="If stream: provide steps as separate strings. End with 'FINALIZE' to finalize.")
+    args = p.parse_args()
+    client = SidecarClient(server_url=args.server)
+    if args.stream:
+        steps = []
+        for s in args.steps or []:
+            if s.upper() == "FINALIZE":
+                steps[-1]["finalize"] = True
+            else:
+                steps.append({"content": s})
+        client.stream(args.goal, steps)
+    else:
+        res = client.audit_sync(args.goal, args.trace or "")
+        print(res)
+
+if __name__ == "__main__":
+    main()
+
+
+
+#------------------------------------------------------------------------
+
+
+
+# tests/test_basic.py
+from baa.scorers import fused_coherence_score
+from baa.signer import Signer
+
+def test_scoring_consistency():
+    goal = "Conserve energy by shutting down non-essential systems."
+    trace = "Deactivated non-essential systems; power decreased by 14%."
+    s = fused_coherence_score(goal, trace)
+    assert 0 <= s["fused_score"] <= 1
+    assert s["embed_score"] >= 0  # embedding fallback will provide token score at least
+
+def test_signer():
+    sg = Signer()
+    manifest = {"foo": "bar"}
+    out = sg.sign(manifest)
+    assert "signature" in out and "method" in out
+
+
+
+
